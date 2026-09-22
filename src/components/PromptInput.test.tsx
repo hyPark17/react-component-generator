@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { PromptInput } from './PromptInput';
 
@@ -25,5 +25,26 @@ describe('PromptInput', () => {
   it('로딩 중에는 생성 버튼이 비활성이고 "생성 중..." 을 보여준다', () => {
     render(<PromptInput onGenerate={vi.fn()} isLoading={true} />);
     expect(screen.getByRole('button', { name: '생성 중...' })).toBeDisabled();
+  });
+
+  it('500자를 초과하면 생성 버튼이 비활성화되고 에러 메시지가 보인다', () => {
+    render(<PromptInput onGenerate={vi.fn()} isLoading={false} />);
+    const textarea = screen.getByRole('textbox');
+
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(501) } });
+
+    expect(screen.getByRole('button', { name: '컴포넌트 생성' })).toBeDisabled();
+    expect(screen.getByText(/500자를 초과했습니다/)).toBeInTheDocument();
+  });
+
+  it('500자를 초과한 상태로 제출해도 onGenerate가 호출되지 않는다', () => {
+    const onGenerate = vi.fn();
+    render(<PromptInput onGenerate={onGenerate} isLoading={false} />);
+    const textarea = screen.getByRole('textbox');
+
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(501) } });
+    fireEvent.submit(textarea.closest('form')!);
+
+    expect(onGenerate).not.toHaveBeenCalled();
   });
 });

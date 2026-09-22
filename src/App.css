@@ -337,6 +337,13 @@
   line-height: 1.65;
 }
 
+.prompt-error {
+  grid-column: 1 / -1;
+  color: var(--danger);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
 .prompt-textarea::placeholder {
   color: #a99f8a;
 }
