@@ -25,4 +25,12 @@ describe('reviveComponents', () => {
     expect(result.prompt).toBe('프롬프트');
     expect(result.code).toBe('const x = 1;');
   });
+
+  it('저장된 데이터의 isStreaming 값과 무관하게 항상 false로 복원한다', () => {
+    const [result] = reviveComponents([
+      { id: '1', prompt: 'p', code: 'c', createdAt: '2026-01-15T10:30:00.000Z', isStreaming: true },
+    ]);
+
+    expect(result.isStreaming).toBe(false);
+  });
 });

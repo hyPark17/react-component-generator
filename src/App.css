@@ -149,8 +149,7 @@
 .composer-panel,
 .settings-panel,
 .component-card,
-.empty-state,
-.loading-card {
+.empty-state {
   background: var(--paper);
   border: 2px solid var(--ink);
   box-shadow: var(--shadow-hard);
@@ -535,18 +534,14 @@
   height: 64px;
 }
 
-.loading-card {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 20px 22px;
-  margin-bottom: 20px;
-}
-
 .loading-pulse {
-  width: 14px;
-  height: 14px;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-left: 8px;
+  border-radius: 50%;
   background: var(--amber);
+  vertical-align: middle;
   animation: pulse 1.1s ease-in-out infinite;
 }
 
@@ -558,11 +553,6 @@
   50% {
     opacity: 1;
   }
-}
-
-.loading-card p {
-  color: var(--ink-soft);
-  font-size: 0.92rem;
 }
 
 .results-grid {

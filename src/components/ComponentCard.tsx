@@ -14,19 +14,30 @@ interface ComponentCardProps {
 type Tab = 'preview' | 'code';
 
 export function ComponentCard({ component, logNumber, onRemove, onRegenerate, isLoading }: ComponentCardProps) {
-  const [activeTab, setActiveTab] = useState<Tab>('preview');
+  const [activeTab, setActiveTab] = useState<Tab>(component.isStreaming ? 'code' : 'preview');
   const [previewKey, setPreviewKey] = useState(0);
+  const [wasStreaming, setWasStreaming] = useState(component.isStreaming);
   const createdAt = component.createdAt.toLocaleTimeString('ko-KR', {
     hour: '2-digit',
     minute: '2-digit',
   });
   const logId = `OUTPUT_${String(logNumber).padStart(3, '0')}.LOG`;
 
+  // 스트리밍이 끝나는 순간(prop 변경)에 맞춰 탭을 미리보기로 전환한다.
+  // effect 대신 렌더 중 상태를 조정해 한 번의 렌더로 반영한다.
+  if (component.isStreaming !== wasStreaming) {
+    setWasStreaming(component.isStreaming);
+    if (!component.isStreaming) setActiveTab('preview');
+  }
+
   return (
     <div className="component-card">
       <div className="card-header">
         <div className="card-title-group">
-          <span>{logId} [{createdAt}]</span>
+          <span>
+            {logId} [{createdAt}]
+            {component.isStreaming && <span className="loading-pulse" aria-hidden="true" />}
+          </span>
           <p className="card-prompt">{component.prompt}</p>
         </div>
         <div className="card-actions">
@@ -57,6 +68,7 @@ export function ComponentCard({ component, logNumber, onRemove, onRegenerate, is
         <button
           className={`tab ${activeTab === 'preview' ? 'tab--active' : ''}`}
           onClick={() => setActiveTab('preview')}
+          disabled={component.isStreaming}
         >
           미리보기
         </button>

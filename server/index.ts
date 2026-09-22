@@ -1,5 +1,8 @@
 import { stripCodeFences, ensureRenderCall } from './generator';
 import { withModelFallback } from './fallback';
+import { extractAnthropicDelta, extractGoogleDelta, formatSSE } from './stream';
+import { toUserErrorMessage } from './errorMessage';
+import { consumeSSEStream } from '../src/utils/sse';
 
 // 우선순위 순서. 앞 모델이 실패하면 다음 모델로 폴백한다.
 const GOOGLE_MODELS = ['gemini-3.1-flash-lite', 'gemini-3.5-flash'];
@@ -65,7 +68,11 @@ function resolveApiKey(provider: Provider, clientKey?: string): string | null {
   return clientKey || ENV_KEYS[provider] || null;
 }
 
-async function callAnthropic(prompt: string, apiKey: string): Promise<string> {
+async function streamAnthropic(
+  prompt: string,
+  apiKey: string,
+  onDelta: (text: string) => void,
+): Promise<void> {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -78,25 +85,27 @@ async function callAnthropic(prompt: string, apiKey: string): Promise<string> {
       max_tokens: 4096,
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: prompt }],
+      stream: true,
     }),
   });
 
-  if (!response.ok) {
+  if (!response.ok || !response.body) {
     throw new Error(`Claude API error: ${response.status}`);
   }
 
-  const data = (await response.json()) as {
-    content: Array<{ type: string; text?: string }>;
-  };
-
-  return data.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('');
+  await consumeSSEStream(response.body, (event) => {
+    const delta = extractAnthropicDelta(event);
+    if (delta) onDelta(delta);
+  });
 }
 
-async function callGoogleModel(prompt: string, apiKey: string, model: string): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+async function streamGoogleModel(
+  prompt: string,
+  apiKey: string,
+  model: string,
+  onDelta: (text: string) => void,
+): Promise<void> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
 
   const response = await fetch(url, {
     method: 'POST',
@@ -108,31 +117,52 @@ async function callGoogleModel(prompt: string, apiKey: string, model: string): P
     }),
   });
 
-  if (!response.ok) {
+  if (!response.ok || !response.body) {
     throw new Error(`Gemini API error: ${response.status}`);
   }
 
-  const data = (await response.json()) as {
-    candidates: Array<{
-      content: { parts: Array<{ text?: string }> };
-      finishReason?: string;
-    }>;
-  };
+  let finishReason: string | undefined;
+  await consumeSSEStream(response.body, (event) => {
+    try {
+      const parsed = JSON.parse(event.data) as { candidates?: Array<{ finishReason?: string }> };
+      finishReason = parsed.candidates?.[0]?.finishReason ?? finishReason;
+    } catch {
+      // ping 등 JSON이 아닌 프레임은 무시한다.
+    }
 
-  const candidate = data.candidates?.[0];
-  if (candidate?.finishReason === 'MAX_TOKENS') {
+    const delta = extractGoogleDelta(event);
+    if (delta) onDelta(delta);
+  });
+
+  if (finishReason === 'MAX_TOKENS') {
     throw new Error('생성된 코드가 너무 길어 잘렸습니다. 더 간단한 컴포넌트를 요청해주세요.');
   }
-
-  return (
-    candidate?.content?.parts
-      ?.map((part) => part.text)
-      ?.join('') ?? ''
-  );
 }
 
-async function callGoogle(prompt: string, apiKey: string): Promise<string> {
-  return withModelFallback(GOOGLE_MODELS, (model) => callGoogleModel(prompt, apiKey, model));
+async function streamGoogle(
+  prompt: string,
+  apiKey: string,
+  onDelta: (text: string) => void,
+): Promise<void> {
+  // 스트리밍 중간에 실패하면 이미 일부 텍스트가 클라이언트로 전송된 상태라,
+  // 다음 모델로 폴백해도 처음부터 다시 보여줄 수 없다(중복/뒤섞임 발생).
+  // 따라서 한 글자라도 전송된 이후의 실패는 폴백하지 않고 원래 에러를 그대로 던진다.
+  let hasEmitted = false;
+  let failureAfterEmit: unknown;
+
+  await withModelFallback(GOOGLE_MODELS, async (model) => {
+    if (hasEmitted) throw failureAfterEmit;
+
+    try {
+      await streamGoogleModel(prompt, apiKey, model, (text) => {
+        hasEmitted = true;
+        onDelta(text);
+      });
+    } catch (err) {
+      if (hasEmitted) failureAfterEmit = err;
+      throw err;
+    }
+  });
 }
 
 const server = Bun.serve({
@@ -157,59 +187,73 @@ const server = Bun.serve({
     }
 
     if (req.method === 'POST' && url.pathname === '/api/generate') {
+      let body: { prompt: string; apiKey?: string; provider?: Provider };
       try {
-        const { prompt, apiKey, provider = 'anthropic' } = (await req.json()) as {
-          prompt: string;
-          apiKey?: string;
-          provider?: Provider;
-        };
-
-        const resolvedKey = resolveApiKey(provider, apiKey);
-
-        if (!resolvedKey) {
-          return Response.json(
-            { error: `API key is required. Set ${provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'GOOGLE_API_KEY'} in .env or enter it manually.` },
-            { status: 400, headers: CORS_HEADERS }
-          );
-        }
-
-        if (!prompt) {
-          return Response.json(
-            { error: 'Prompt is required' },
-            { status: 400, headers: CORS_HEADERS }
-          );
-        }
-
-        const text =
-          provider === 'google'
-            ? await callGoogle(prompt, resolvedKey)
-            : await callAnthropic(prompt, resolvedKey);
-
-        const code = ensureRenderCall(stripCodeFences(text));
-
-        return Response.json({ code }, { headers: CORS_HEADERS });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error';
-
-        if (message.includes('503')) {
-          return Response.json(
-            { error: 'API 서버가 일시적으로 과부하 상태입니다. 잠시 후 다시 시도해주세요.' },
-            { status: 503, headers: CORS_HEADERS }
-          );
-        }
-
-        if (message.includes('429')) {
-          return Response.json(
-            { error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.' },
-            { status: 429, headers: CORS_HEADERS }
-          );
-        }
-
+        body = (await req.json()) as typeof body;
+      } catch {
         return Response.json(
-          { error: message },
-          { status: 500, headers: CORS_HEADERS }
+          { error: 'Invalid JSON body' },
+          { status: 400, headers: CORS_HEADERS }
         );
       }
+
+      const { prompt, apiKey, provider = 'anthropic' } = body;
+
+      const resolvedKey = resolveApiKey(provider, apiKey);
+
+      if (!resolvedKey) {
+        return Response.json(
+          { error: `API key is required. Set ${provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'GOOGLE_API_KEY'} in .env or enter it manually.` },
+          { status: 400, headers: CORS_HEADERS }
+        );
+      }
+
+      if (!prompt) {
+        return Response.json(
+          { error: 'Prompt is required' },
+          { status: 400, headers: CORS_HEADERS }
+        );
+      }
+
+      // 응답 헤더를 보낸 뒤에는 상태 코드를 바꿀 수 없으므로, 생성 중 에러도
+      // 본문 안에서 SSE의 error 이벤트로 흘려보낸다(항상 200 + text/event-stream).
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const encoder = new TextEncoder();
+          let raw = '';
+
+          const emit = (event: string, data: unknown) => {
+            controller.enqueue(encoder.encode(formatSSE(event, JSON.stringify(data))));
+          };
+
+          const onDelta = (text: string) => {
+            raw += text;
+            emit('chunk', { code: stripCodeFences(raw) });
+          };
+
+          try {
+            if (provider === 'google') {
+              await streamGoogle(prompt, resolvedKey, onDelta);
+            } else {
+              await streamAnthropic(prompt, resolvedKey, onDelta);
+            }
+
+            emit('done', { code: ensureRenderCall(stripCodeFences(raw)) });
+          } catch (err) {
+            emit('error', { error: toUserErrorMessage(err) });
+          } finally {
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          ...CORS_HEADERS,
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+        },
+      });
     }
 
     return Response.json(
